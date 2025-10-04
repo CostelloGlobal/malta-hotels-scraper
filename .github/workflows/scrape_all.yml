@@ -25,7 +25,7 @@ jobs:
         run: python hotels_all.py
 
       - name: Upload full results CSV
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: hotels_all_output
           path: hotels_enriched.csv
