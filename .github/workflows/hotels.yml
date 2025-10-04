@@ -1,0 +1,33 @@
+name: Scrape All Malta Hotels
+
+on:
+  workflow_dispatch:  # allows you to run it manually
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run hotel scraper and enricher
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python hotels.py
+
+      - name: Upload results CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: hotels-enriched
+          path: hotels_enriched.csv
