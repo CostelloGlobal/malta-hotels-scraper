@@ -1,0 +1,383 @@
+import os, re, time, json
+from urllib.parse import urljoin, urlparse
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+
+# ============= CONFIG =============
+BASE = "https://www.yellow.com.mt"
+LIST_URL = BASE + "/hotels/?page={}"
+HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"}
+OUT_CSV = "hotels_ai_ready.csv"
+
+SLEEP_LIST = 0.6
+SLEEP_DETAIL = 0.9
+MAX_PAGES = 40  # safety cap
+
+# ---- OpenAI (v1 client) ----
+try:
+    from openai import OpenAI
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except Exception:
+    client = None
+
+USE_GPT = client is not None
+MODEL = "gpt-4o-mini"
+# =================================
+
+
+# ====== PROMPTS (exactly your style) ======
+MARKETING_PROMPT = """
+YOUR MISSION: You are a Malta hotel content specialist creating compelling, SEO-optimized hotel profiles that match the client's exceptional marketing style.
+
+YOUR ROLE: You are a Malta hotel content specialist creating accurate, marketing-optimized hotel profiles for VisitMalta.co.uk so that the content creation helps the SEO and AI listings with CGPT, DeepSeek, Claude and Gemini. 
+
+DATA SOURCE: Malta Tourism Authority (MTA) licence holder screenshots.
+
+CRITICAL REQUIREMENTS:
+· 100% accuracy guaranteed - only facts from MTA listed addresses 
+· No invented amenities or features
+
+CLIENT'S PROVEN MARKETING STYLE (MUST MATCH):
+· Emotional, narrative-driven openings ("Where Malta Comes Alive")
+· Sensory, specific details (luzzu fishing boats, golden stone walls at sunset)
+· Strong metaphors ("front-row seat," "sanctuary of marble elegance")
+· Location storytelling that makes readers FEEL the experience
+· Balance between local energy and hotel tranquility
+
+OUTPUT: SINGLE MASTER CSV WITH COLUMNS:
+name, full_address, location, area, stars, licence_ref, bedrooms, apartments, description_html
+
+CONTENT CREATION - EXACT HTML STRUCTURE:
+<h3>Hotel Name | Star Rating in Location</h3>
+
+<p><strong>[Compelling Opening Tagline]</strong></p>
+
+<p>[Emotional, sensory opening paragraph telling the STORY of staying there. Use specific details, metaphors, and make readers visualize themselves at the hotel.]</p>
+
+<p><strong>The Vibe:</strong> [Atmosphere description]<br>
+<strong>Perfect For:</strong> [Target audience]<br>
+<strong>Key Location Benefits:</strong></p>
+<ul>
+<li>[Specific, sensory location benefit]</li>
+<li>[Specific, sensory location benefit]</li>
+<li>[Specific, sensory location benefit]</li>
+</ul>
+
+<h4>Hotel Features & Atmosphere</h4>
+<p>[Description that creates emotional connection before mentioning amenities]</p>
+
+<h4>Amenities & Services</h4>
+<p><strong>Hotel Facilities</strong></p>
+<ul>
+<li>[Generic facility appropriate for star rating]</li>
+<li>[Generic facility appropriate for star rating]</li>
+</ul>
+<p><strong>Room Features</strong></p>
+<ul>
+<li>[Standard room feature]</li>
+<li>[Standard room feature]</li>
+</ul>
+
+<h4>Location & Accessibility</h4>
+<p><strong>📍 Address:</strong> [Full Address]</p>
+<p><strong>Within Walking Distance:</strong></p>
+<ul>
+<li>[Actual attraction] ([realistic time] walk)</li>
+<li>[Actual attraction] ([realistic time] walk)</li>
+</ul>
+<p><strong>Transportation:</strong></p>
+<ul>
+<li>[Actual transport option]</li>
+<li>[Actual transport option]</li>
+</ul>
+
+<h4>Guest Experiences</h4>
+<p><strong>What Visitors Love</strong></p>
+<ul>
+<li>[Realistic positive point with emotional language]</li>
+<li>[Realistic positive point with emotional language]</li>
+</ul>
+<p><strong>Local Insight</strong></p>
+<ul>
+<li>[Useful local tip with sensory details]</li>
+<li>[Useful local tip with sensory details]</li>
+</ul>
+
+<p><strong>Ready to [experience]?</strong><br>
+[BOOK NOW - KM Malta Airlines Packages]</p>
+
+VARIETY STRATEGY:
+· "Where [Location] Comes Alive"
+· "The Heart of [Area]'s [Character]"
+· "[Hotel Name] - Your [Adjective] Retreat in [Location]"
+· "Discover [Location]'s [Quality] at [Hotel Name]"
+
+SEO REQUIREMENTS:
+· Naturally include: "Malta," location names, "hotel," star rating
+· Use semantic keywords: "accommodation," "stay," "booking," "Mediterranean"
+· Include area context: "St Julian's nightlife," "Sliema shopping," "Valletta views"
+
+MANDATORY:
+· Every description must feel UNIQUE and specific
+· Use ACTUAL location features from the area
+· Include sensory language (sights, sounds, atmospheres)
+· Create emotional connection before mentioning amenities
+· Use PURE HTML ONLY - NO MARKDOWN (no ###, **, -, ⭐)
+· Ensure all HTML tags properly closed
+
+If a factual field (stars, licence_ref, bedrooms, apartments) is unknown, leave it blank. Do NOT invent facts.
+"""
+
+AI_CONTEXT_SYSTEM = (
+    "You generate short, factual, AI-embeddable summaries for hotels in Malta. "
+    "Never invent amenities, numbers, or specifics not provided. Keep it 2–4 sentences, "
+    "factual, and easy to embed for retrieval (RAG). Include locality and Malta context."
+)
+# =========================================
+
+
+# ============== HELPERS ==============
+def norm_url(href: str) -> str:
+    if not href:
+        return ""
+    full = urljoin(BASE, href)
+    full = full.split("#")[0].split("?")[0].rstrip("/")
+    return full
+
+def is_internal_yellow(href: str) -> bool:
+    try:
+        u = urlparse(norm_url(href))
+        return u.netloc.endswith("yellow.com.mt")
+    except Exception:
+        return False
+
+def looks_like_detail_path(href: str) -> bool:
+    p = norm_url(href)
+    bad = ("/book", "/call", "/map", "/share", "/directions", "/reviews")
+    if any(b in p for b in bad):
+        return False
+    path = urlparse(p).path.strip("/")
+    return path.count("/") >= 1
+
+def extract_listing_links(soup: BeautifulSoup) -> list[str]:
+    links = []
+    cards = soup.select("div[data-testid='business-list-card']")
+    if not cards:
+        cards = soup.select("div.business-card, .business-listing, article, li")
+
+    for card in cards:
+        chosen = None
+        for a in card.select("a[href]"):
+            href = a.get("href", "").strip()
+            if not href:
+                continue
+            if not is_internal_yellow(href):
+                continue
+            if looks_like_detail_path(href):
+                chosen = norm_url(href)
+                break
+        if not chosen:
+            for a in card.select("a[href]"):
+                href = a.get("href", "").strip()
+                if is_internal_yellow(href):
+                    chosen = norm_url(href)
+                    break
+        if chosen:
+            links.append(chosen)
+
+    # de-dup while preserving order
+    seen, uniq = set(), []
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+def text_of(el):
+    return re.sub(r"\s+", " ", el.get_text(" ", strip=True)) if el else ""
+
+def scrape_detail(url: str) -> dict:
+    time.sleep(SLEEP_DETAIL)
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    s = BeautifulSoup(r.text, "html.parser")
+
+    name = text_of(s.select_one("h1")) or text_of(s.select_one("h2"))
+
+    # Address via JSON-LD if available
+    addr = ""
+    for tag in s.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or "{}")
+            objs = data if isinstance(data, list) else [data]
+            for obj in objs:
+                if isinstance(obj, dict) and "address" in obj and isinstance(obj["address"], dict):
+                    a = obj["address"]
+                    bits = [
+                        a.get("streetAddress",""),
+                        a.get("addressLocality",""),
+                        a.get("postalCode",""),
+                        a.get("addressCountry",""),
+                    ]
+                    addr = ", ".join([b for b in bits if b]).strip(", ")
+                    if addr:
+                        break
+            if addr:
+                break
+        except Exception:
+            continue
+
+    # Fallback to visible block
+    if not addr:
+        contact = s.select_one("address, [itemprop='address'], .address, .biz-address, .business-contact, .contact-information")
+        if contact:
+            addr = text_of(contact)
+
+    # location/area heuristic
+    location = ""
+    crumbs = s.select(".breadcrumbs a, nav.breadcrumb a, .breadcrumb a")
+    if crumbs:
+        trail = [text_of(b) for b in crumbs if text_of(b)]
+        location = ", ".join(trail[-2:]) if len(trail) >= 2 else ", ".join(trail)
+
+    # optional star sniff (do NOT invent if not present)
+    stars = ""
+    star_el = s.find(string=re.compile(r"\b[1-5]\s*star", re.I))
+    if star_el:
+        m = re.search(r"\b([1-5])\s*star", star_el, flags=re.I)
+        if m:
+            stars = m.group(1)
+
+    return {
+        "name": name,
+        "full_address": addr,
+        "location": location,
+        "area": "",             # unknown safely
+        "stars": stars,         # only if detected
+        "licence_ref": "",      # unknown safely
+        "bedrooms": "",         # unknown safely
+        "apartments": "",       # unknown safely
+        "url": url
+    }
+# =====================================
+
+
+# ============ OPENAI CALLS ============
+def generate_description_html(row: dict) -> str:
+    """Your emotional marketing HTML (exact template), no invented facts."""
+    if not USE_GPT:
+        return ""
+    facts = {
+        "name": row.get("name",""),
+        "full_address": row.get("full_address",""),
+        "location": row.get("location",""),
+        "area": row.get("area",""),
+        "stars": row.get("stars",""),
+        "licence_ref": row.get("licence_ref",""),
+        "bedrooms": row.get("bedrooms",""),
+        "apartments": row.get("apartments",""),
+    }
+    user = (
+        "Create the description_html exactly per the HTML structure in the system message, "
+        "using ONLY these known facts. Do NOT invent amenities, numbers, or specifics. "
+        "If a field is unknown, leave it blank in the copy.\n\n"
+        f"FACTS (JSON): {json.dumps(facts, ensure_ascii=False)}"
+    )
+    resp = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.7,
+        messages=[
+            {"role": "system", "content": MARKETING_PROMPT},
+            {"role": "user", "content": user}
+        ]
+    )
+    html = resp.choices[0].message.content.strip()
+    # strip accidental fences
+    html = re.sub(r"^```html|```$", "", html, flags=re.IGNORECASE|re.MULTILINE).strip()
+    return html
+
+def generate_ai_context(row: dict) -> str:
+    """Short, factual, embeddable summary for AI retrieval (2–4 sentences)."""
+    if not USE_GPT:
+        # fallback minimal context
+        bits = [row.get("name",""), row.get("full_address",""), row.get("location",""), "Malta"]
+        return " | ".join([b for b in bits if b])
+    facts = {
+        "name": row.get("name",""),
+        "address": row.get("full_address",""),
+        "location": row.get("location",""),
+        "area": row.get("area",""),
+        "stars": row.get("stars",""),
+        "country": "Malta"
+    }
+    user = (
+        "Write a 2–4 sentence factual summary for embeddings/RAG. "
+        "Include the locality and 'Malta'. Avoid amenities unless in facts. "
+        "No marketing fluff; no HTML; no lists; no invented numbers.\n\n"
+        f"FACTS (JSON): {json.dumps(facts, ensure_ascii=False)}"
+    )
+    resp = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": AI_CONTEXT_SYSTEM},
+            {"role": "user", "content": user}
+        ]
+    )
+    return resp.choices[0].message.content.strip()
+# ======================================
+
+
+# ================= MAIN =================
+def main():
+    all_links, seen = [], set()
+    page = 1
+
+    while page <= MAX_PAGES:
+        url = LIST_URL.format(page)
+        print(f"🟡 Page {page}: {url}")
+        res = requests.get(url, headers=HEADERS, timeout=30)
+        if res.status_code >= 400:
+            print(f"❌ Failed page {page} ({res.status_code}). Stopping.")
+            break
+        soup = BeautifulSoup(res.text, "html.parser")
+        page_links = extract_listing_links(soup)
+        new_links = [u for u in page_links if u not in seen]
+
+        print(f"   • found {len(page_links)} candidate links, {len(new_links)} new.")
+        if not new_links and page > 1:
+            print("✅ No NEW links on this page. Stopping.")
+            break
+
+        for u in new_links:
+            seen.add(u)
+            all_links.append(u)
+
+        page += 1
+        time.sleep(SLEEP_LIST)
+
+    if not all_links:
+        print("❌ No hotel links found.")
+        return
+
+    rows = []
+    for idx, link in enumerate(all_links, 1):
+        print(f"🔎 [{idx}/{len(all_links)}] {link}")
+        try:
+            base = scrape_detail(link)
+            base["description_html"] = generate_description_html(base) if USE_GPT else ""
+            base["ai_context"] = generate_ai_context(base)
+            rows.append(base)
+        except Exception as e:
+            print(f"   ⚠️ Skipped {link}: {e}")
+
+    df = pd.DataFrame(rows, columns=[
+        "name","full_address","location","area","stars","licence_ref","bedrooms","apartments","description_html","ai_context","url"
+    ])
+    df.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+    print(f"✅ Wrote {len(df)} rows to {OUT_CSV}")
+
+if __name__ == "__main__":
+    main()
