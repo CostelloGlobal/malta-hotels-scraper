@@ -1,0 +1,64 @@
+name: Scrape All Malta Hotels
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install chromium
+          pip install beautifulsoup4 pandas
+
+      - name: Run scraper
+        run: |
+          python3 <<'PYCODE'
+          import requests, csv
+          from bs4 import BeautifulSoup
+
+          base_url = "https://www.yellow.com.mt"
+          start_url = f"{base_url}/hotels/"
+          hotels = []
+
+          while start_url:
+              print(f"Scraping: {start_url}")
+              r = requests.get(start_url, timeout=30)
+              soup = BeautifulSoup(r.text, "html.parser")
+
+              listings = soup.select("a[href*='/hotels/']")
+              for link in listings:
+                  href = link.get("href")
+                  if not href or href in [h["url"] for h in hotels]:
+                      continue
+                  name = link.get_text(strip=True)
+                  hotels.append({"name": name, "url": base_url + href})
+
+              next_page = soup.select_one("a[rel='next']")
+              start_url = base_url + next_page["href"] if next_page else None
+
+          print(f"Found {len(hotels)} hotels.")
+
+          # Write CSV
+          with open("hotels.csv", "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["name","url"])
+              writer.writeheader()
+              writer.writerows(hotels)
+          PYCODE
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: malta-hotels
+          path: hotels.csv
