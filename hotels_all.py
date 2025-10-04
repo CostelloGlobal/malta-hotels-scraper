@@ -1,33 +1,30 @@
-import os, re, time, json, requests
+import os
+import re
+import time
+import json
+from urllib.parse import urljoin, urlparse
+import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 import openai
 
-# ======================
+# ==============================
 # CONFIG
-# ======================
-BASE_URL = "https://www.yellow.com.mt/hotels/?page={}"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+# ==============================
+BASE = "https://www.yellow.com.mt"
+LIST_URL = BASE + "/hotels/?page={}"
+HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"}
 OUT_CSV = "hotels_enriched.csv"
 
-# polite pacing (tweak if needed)
-SLEEP_LIST = 0.3       # between list pages
-SLEEP_DETAIL = 0.4     # between hotel detail requests
+SLEEP_LIST = 0.5
+SLEEP_DETAIL = 0.8
+MAX_PAGES = 20
 
-# safety stop so it never runs forever even if site structure changes
-HARD_STOP_PAGES = 200
+# ——— GPT (v0.28.1 syntax) ———
+openai.api_key = os.getenv("OPENAI_API_KEY", "")
+USE_GPT = bool(openai.api_key) and True  # set False to skip enrichment
 
-# OpenAI (v0.28.x)
-openai.api_key = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = "gpt-3.5-turbo"
-
-# Broad selector, then we filter by URL pattern
-CARD_SELECTOR = "a.business-name, div.business-card a, h2 a, .business-listing a"
-
-# ======================
-# PROMPT (your marketing brief)
-# ======================
-MARKETING_BRIEF = """
+MARKETING_PROMPT = """
 YOUR MISSION: You are a Malta hotel content specialist creating compelling, SEO-optimized hotel profiles that match the client's exceptional marketing style.
 
 YOUR ROLE: You are a Malta hotel content specialist creating accurate, marketing-optimized hotel profiles for VisitMalta.co.uk so that the content creation helps the SEO and AI listings with CGPT, DeepSeek, Claude and Gemini.
@@ -44,13 +41,6 @@ CLIENT'S PROVEN MARKETING STYLE (MUST MATCH):
 · Strong metaphors ("front-row seat," "sanctuary of marble elegance")
 · Location storytelling that makes readers FEEL the experience
 · Balance between local energy and hotel tranquility
-
-1. MARKETING QUALITY STANDARD:
-· Write in compelling, emotional marketing language that sells the experience
-· Use descriptive, sensory language that makes readers visualize their stay
-· Create unique, engaging openings for each hotel (no templates)
-· Balance location benefits with hotel comfort
-· Target specific traveler types appropriately
 
 OUTPUT: SINGLE MASTER CSV WITH COLUMNS:
 name, full_address, location, area, stars, licence_ref, bedrooms, apartments, description_html
@@ -106,197 +96,225 @@ CONTENT CREATION - EXACT HTML STRUCTURE:
 <p><strong>Ready to [experience]?</strong><br>
 [BOOK NOW - KM Malta Airlines Packages]</p>
 
-VARIETY STRATEGY - USE DIFFERENT OPENINGS:
-· "Where [Location] Comes Alive"
-· "The Heart of [Area]'s [Character]"
-· "[Hotel Name] - Your [Adjective] Retreat in [Location]"
-· "Discover [Location]'s [Quality] at [Hotel Name]"
+VARIETY STRATEGY:
+Use different openings like: "Where [Location] Comes Alive" / "The Heart of [Area]'s [Character]" / "[Hotel Name] - Your [Adjective] Retreat in [Location]" / "Discover [Location]'s [Quality] at [Hotel Name]"
 
 SEO REQUIREMENTS:
-· Naturally include: "Malta," location names, "hotel," star rating
-· Use semantic keywords: "accommodation," "stay," "booking," "Mediterranean"
-· Include area context: "St Julian's nightlife," "Sliema shopping," "Valletta views"
+Include “Malta”, location names, “hotel”, star rating; semantic keywords: accommodation, stay, booking, Mediterranean; area context like St Julian's nightlife, Sliema shopping, Valletta views.
 
 MANDATORY:
-· Every description must feel UNIQUE and specific
-· Use ACTUAL location features from the area
-· Include sensory language (sights, sounds, atmospheres)
-· Create emotional connection before mentioning amenities
-· Use PURE HTML ONLY - NO MARKDOWN (no ###, **, -, ⭐)
-· Ensure all HTML tags properly closed
+Every description must be UNIQUE and specific; only use actual location features; sensory language; emotional before amenities; PURE HTML ONLY (no markdown); close all tags.
+
+If any factual fields are missing (stars, licence_ref, bedrooms, apartments), leave them blank — do NOT invent.
 """
 
-# ======================
+# ==============================
 # HELPERS
-# ======================
-def norm(s):
-    return " ".join((s or "").split())
-
-def abs_url(href):
+# ==============================
+def norm_url(href: str) -> str:
     if not href:
         return ""
-    if href.startswith("http"):
-        return href
-    if href.startswith("//"):
-        return "https:" + href
-    if href.startswith("/"):
-        return "https://www.yellow.com.mt" + href
-    return "https://www.yellow.com.mt/" + href.lstrip("./")
+    full = urljoin(BASE, href)
+    full = full.split("#")[0].split("?")[0].rstrip("/")
+    return full
 
-def is_hotel_link(href):
-    if not href:
+def is_internal_yellow(href: str) -> bool:
+    try:
+        u = urlparse(norm_url(href))
+        return u.netloc.endswith("yellow.com.mt")
+    except Exception:
         return False
-    href = href.lower()
-    # strict filter: we only keep real business pages in the Hotels category
-    if "yellow.com.mt" in href and "/hotels/" in href and "mailto:" not in href and "tel:" not in href:
-        return True
-    return False
 
-def get(url, kind="page"):
-    r = requests.get(url, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    return r
+def looks_like_detail_path(href: str) -> bool:
+    """
+    Accept internal detail pages like:
+      https://www.yellow.com.mt/<slug>-hotel.../
+    Reject phone/map/share/book/etc.
+    """
+    p = norm_url(href)
+    bad = ("/book", "/call", "/map", "/share", "/directions", "/reviews")
+    if any(b in p for b in bad):
+        return False
+    # Needs at least two path segments to be a profile
+    try:
+        path = urlparse(p).path.strip("/")
+        return path.count("/") >= 1
+    except Exception:
+        return False
 
-def extract_address_area(soup):
-    # best-effort parse — keeps blanks if not found (never invents)
-    text = soup.get_text(" ", strip=True)
-    address = ""
-    area = ""
+def extract_listing_links(soup: BeautifulSoup) -> list[str]:
+    links = []
+    # Primary: real card container
+    cards = soup.select("div[data-testid='business-list-card']")
+    # Fallbacks in case YP tweaks attributes
+    if not cards:
+        cards = soup.select("div.business-card, .business-listing, article, li")
 
-    # Try microdata/address tag
-    addr_tag = soup.find(["address"])
-    if addr_tag:
-        address = norm(addr_tag.get_text(" ", strip=True))
-
-    # fallback: common patterns on Yellow
-    if not address:
-        m = re.search(r"Address\s*:?\s*(.+?)(?:\s{2,}|Tel|Phone|Website)", text, flags=re.I)
-        if m:
-            address = norm(m.group(1))
-
-    # area heuristic: last token after comma in address (e.g., "St Julian's")
-    if address and "," in address:
-        area = norm(address.split(",")[-1])
-
-    return address, area
-
-def ai_enrich(name, address, area, url):
-    """Generate description_html using the pinned OpenAI v0.28.x client."""
-    sys = MARKETING_BRIEF.strip()
-    user = json.dumps({
-        "name": name,
-        "full_address": address,
-        "area": area,
-        "source_url": url
-    }, ensure_ascii=False)
-
-    for attempt in range(4):
-        try:
-            resp = openai.ChatCompletion.create(
-                model=OPENAI_MODEL,
-                temperature=0.7,
-                messages=[
-                    {"role": "system", "content": sys},
-                    {"role": "user", "content": f"Create the HTML description for this hotel using ONLY factual address/location details you can infer safely. If unsure, leave fields generic but true-to-rating/area. Data: {user}"}
-                ]
-            )
-            return resp["choices"][0]["message"]["content"]
-        except Exception as e:
-            wait = 2 * (attempt + 1)
-            print(f"⚠️ OpenAI retry {attempt+1}: {e} (sleep {wait}s)")
-            time.sleep(wait)
-    return ""
-
-# ======================
-# MAIN SCRAPER
-# ======================
-def scrape_all():
-    seen_links = set()
-    rows = []
-    total_found = 0
-
-    for page in range(1, HARD_STOP_PAGES + 1):
-        url = BASE_URL.format(page)
-        print(f"🟡 Page {page}: {url}")
-        try:
-            res = get(url, "list")
-        except Exception as e:
-            print(f"⚠️ List request failed (page {page}): {e}")
-            break
-
-        soup = BeautifulSoup(res.text, "html.parser")
-        anchors = soup.select(CARD_SELECTOR)
-
-        # filter + normalize
-        page_links = []
-        for a in anchors:
-            href = abs_url(a.get("href", ""))
-            if not is_hotel_link(href):
+    for card in cards:
+        chosen = None
+        for a in card.select("a[href]"):
+            href = a.get("href", "").strip()
+            if not href:
                 continue
-            txt = norm(a.get_text())
-            page_links.append((txt, href))
+            if not is_internal_yellow(href):
+                # skip external (Booking.com, etc.)
+                continue
+            if looks_like_detail_path(href):
+                chosen = norm_url(href)
+                break
+        if not chosen:
+            # last resort — first internal link
+            for a in card.select("a[href]"):
+                href = a.get("href", "").strip()
+                if is_internal_yellow(href):
+                    chosen = norm_url(href)
+                    break
+        if chosen:
+            links.append(chosen)
+    # unique, keep order
+    seen = set()
+    uniq = []
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
 
-        # de-dup (page + global)
-        new_this_page = []
-        for name, href in page_links:
-            if href not in seen_links:
-                seen_links.add(href)
-                new_this_page.append((name, href))
+def text_of(el):
+    return re.sub(r"\s+", " ", el.get_text(" ", strip=True)) if el else ""
 
-        print(f"   → found {len(page_links)} candidate links, {len(new_this_page)} new after filtering.")
+def scrape_detail(url: str) -> dict:
+    time.sleep(SLEEP_DETAIL)
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    s = BeautifulSoup(r.text, "html.parser")
 
-        if not new_this_page:
-            print("✅ No NEW hotel links on this page. Stopping.")
+    name = text_of(s.select_one("h1")) or text_of(s.select_one("h2"))
+    # Try common address blocks
+    addr = ""
+    address_el = s.select_one("address")
+    if not address_el:
+        address_el = s.select_one("[itemprop='address']") or s.select_one(".address, .biz-address")
+    addr = text_of(address_el)
+
+    # Try to get locality/area hints from chips/breadcrumbs
+    location = ""
+    bread = s.select(".breadcrumbs a, nav.breadcrumb a, .breadcrumb a")
+    if bread:
+        crumbs = [text_of(b) for b in bread if text_of(b)]
+        location = ", ".join(crumbs[-2:]) if len(crumbs) >= 2 else ", ".join(crumbs)
+
+    # Cheap star guess from icon text if present (do NOT invent)
+    stars = ""
+    star_el = s.find(string=re.compile(r"\b[1-5]\s*star", re.I))
+    if star_el:
+        m = re.search(r"\b([1-5])\s*star", star_el, flags=re.I)
+        if m:
+            stars = m.group(1)
+
+    data = {
+        "name": name,
+        "full_address": addr,
+        "location": location,
+        "area": "",
+        "stars": stars,
+        "licence_ref": "",
+        "bedrooms": "",
+        "apartments": "",
+        "url": url,
+    }
+    return data
+
+def enrich_with_gpt(row: dict) -> str:
+    # Build the minimal facts block we actually have
+    facts = {
+        "name": row.get("name", ""),
+        "address": row.get("full_address", ""),
+        "location": row.get("location", ""),
+        "area": row.get("area", ""),
+        "stars": row.get("stars", ""),
+        "licence_ref": row.get("licence_ref", ""),
+        "bedrooms": row.get("bedrooms", ""),
+        "apartments": row.get("apartments", ""),
+    }
+    user_msg = (
+        "Create the description_html exactly per the HTML structure, "
+        "using ONLY these known facts. Leave any unknown field blank in the HTML, "
+        "and do NOT invent amenities or numbers.\n\n"
+        f"FACTS (JSON): {json.dumps(facts, ensure_ascii=False)}"
+    )
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": MARKETING_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.7,
+        )
+        return resp["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return ""
+
+# ==============================
+# MAIN
+# ==============================
+def main():
+    all_links = []
+    seen = set()
+    page = 1
+
+    while page <= MAX_PAGES:
+        url = LIST_URL.format(page)
+        print(f"🟡 Page {page}: {url}")
+        res = requests.get(url, headers=HEADERS, timeout=30)
+        if res.status_code >= 400:
+            print(f"❌ Failed page {page} ({res.status_code}). Stopping.")
             break
+        soup = BeautifulSoup(res.text, "html.parser")
+        page_links = extract_listing_links(soup)
+        # Filter out ones we've already seen
+        new_links = [u for u in page_links if u not in seen]
 
-        # visit each hotel once
-        for (name, link) in new_this_page:
-            try:
-                hres = get(link, "detail")
-                hsoup = BeautifulSoup(hres.text, "html.parser")
-                address, area = extract_address_area(hsoup)
+        print(f"   • found {len(page_links)} candidate links, {len(new_links)} new after filtering.")
+        for i, u in enumerate(new_links, 1):
+            print(f"     {i}. {u.split('/')[-1].replace('-', ' ').title()}")
 
-                # never invent stars/licence/bedrooms/apartments — keep blank unless you add reliable parsing later
-                description_html = ai_enrich(name or "", address or "", area or "", link)
+        if not new_links:
+            # If page had zero new items, try one more page; if again zero, stop
+            if page > 1:
+                print("✅ No NEW hotel links on this page. Stopping.")
+                break
+        for u in new_links:
+            seen.add(u)
+            all_links.append(u)
 
-                rows.append({
-                    "name": name or "",
-                    "full_address": address or "",
-                    "location": "",                 # left blank (no invention)
-                    "area": area or "",
-                    "stars": "",
-                    "licence_ref": "",
-                    "bedrooms": "",
-                    "apartments": "",
-                    "description_html": description_html or "",
-                    "url": link
-                })
-
-                total_found += 1
-                print(f"      ✓ {total_found}. {name or '(no name)'}")
-
-            except Exception as e:
-                print(f"      ✗ Failed {link}: {e}")
-
-            time.sleep(SLEEP_DETAIL)
-
+        page += 1
         time.sleep(SLEEP_LIST)
 
-    # write CSV
-    if rows:
-        df = pd.DataFrame(rows, columns=[
-            "name","full_address","location","area","stars",
-            "licence_ref","bedrooms","apartments","description_html","url"
-        ])
-        df.to_csv(OUT_CSV, index=False, encoding="utf-8")
-        print(f"✅ Wrote {len(rows)} rows to {OUT_CSV}")
-    else:
-        # still write headers so the artifact exists
-        pd.DataFrame(columns=[
-            "name","full_address","location","area","stars",
-            "licence_ref","bedrooms","apartments","description_html","url"
-        ]).to_csv(OUT_CSV, index=False, encoding="utf-8")
-        print("⚠️ No rows scraped. Wrote empty CSV headers.")
+    if not all_links:
+        print("❌ No hotel links found. Check selectors.")
+        return
+
+    rows = []
+    for idx, link in enumerate(all_links, 1):
+        print(f"🔎 [{idx}/{len(all_links)}] {link}")
+        try:
+            row = scrape_detail(link)
+            if USE_GPT:
+                row["description_html"] = enrich_with_gpt(row)
+            else:
+                row["description_html"] = ""
+            rows.append(row)
+        except Exception as e:
+            print(f"   ⚠️ Skipped {link}: {e}")
+
+    df = pd.DataFrame(rows, columns=[
+        "name","full_address","location","area","stars","licence_ref","bedrooms","apartments","description_html","url"
+    ])
+    df.to_csv(OUT_CSV, index=False, encoding="utf-8")
+    print(f"✅ Wrote {len(df)} rows to {OUT_CSV}")
 
 if __name__ == "__main__":
-    scrape_all()
+    main()
