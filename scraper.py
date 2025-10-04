@@ -1,133 +1,47 @@
-import os, re, csv, asyncio, unicodedata
-from pathlib import Path
-from urllib.parse import urlparse
-from playwright.async_api import async_playwright
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
 
-# ------------ CONFIG ------------
-START_URL_TEMPLATE = "https://www.yellow.com.mt/hotels/malta/?page={page}"
-OUTPUT_CSV = "hotels.csv"
-IMAGES_DIR = Path("images")
-# --------------------------------
+base_url = "https://www.yellow.com.mt/hotels/?page={}"
+hotel_data = []
 
-IMAGES_DIR.mkdir(exist_ok=True)
+print("🔍 Starting hotel scrape...")
 
-def slugify(text: str) -> str:
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
-    text = re.sub(r"[^a-zA-Z0-9\\-_. ]+", "", text).strip().lower()
-    text = re.sub(r"\\s+", "-", text)
-    return text[:60] or "image"
+for page in range(1, 50):  # Will go through all pages
+    url = base_url.format(page)
+    print(f"Scraping page {page}: {url}")
+    response = requests.get(url)
+    if response.status_code != 200:
+        print(f"⚠️ Failed to load page {page}")
+        break
 
-async def scrape():
-    rows = []
-    seen = set()
-    page_num = 1
+    soup = BeautifulSoup(response.text, "html.parser")
+    listings = soup.select("div[data-testid='business-list-card']")
+    if not listings:
+        print("✅ No more listings found, stopping.")
+        break
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
+    for listing in listings:
+        name_tag = listing.select_one("h2 a")
+        if name_tag:
+            name = name_tag.text.strip()
+            link = "https://www.yellow.com.mt" + name_tag.get("href")
+        else:
+            name = "N/A"
+            link = "N/A"
 
-        while True:
-            list_url = START_URL_TEMPLATE.format(page=page_num)
-            print(f"Scraping list: {list_url}")
-            await page.goto(list_url, timeout=60000)
-            await page.wait_for_timeout(1500)
+        address_tag = listing.select_one("p")
+        address = address_tag.text.strip() if address_tag else "N/A"
 
-            links = await page.eval_on_selector_all(
-                "a[href*='_hotels+']",
-                "els => els.map(e => e.href)"
-            )
-            if not links:
-                print(f"No more results on page {page_num}.")
-                break
+        hotel_data.append({
+            "name": name,
+            "address": address,
+            "url": link
+        })
 
-            for link in links:
-                if link in seen:
-                    continue
-                seen.add(link)
-                try:
-                    await page.goto(link, timeout=60000)
-                    await page.wait_for_timeout(1200)
+    time.sleep(1)
 
-                    name = (await page.text_content("h1") or "").strip() or "Unknown Hotel"
-
-                    address = ""
-                    addr_node = await page.query_selector(".contact-information, .business-contact, .address")
-                    if addr_node:
-                        address = (await addr_node.inner_text()).strip()
-
-                    # Rough split for location/area from the tail of the address (best-effort)
-                    location = area = ""
-                    if "," in address:
-                        parts = [x.strip() for x in address.split(",") if x.strip()]
-                        if len(parts) >= 1:
-                            location = parts[-1]
-                        if len(parts) >= 2:
-                            area = parts[-2]
-
-                    # Try to grab a representative image (if present)
-                    image_filename = ""
-                    imgs = await page.query_selector_all("div.business-photos img, div.gallery img, .swiper-slide img, meta[property='og:image']")
-                    img_url = ""
-                    if imgs:
-                        if await imgs[0].get_attribute("content"):
-                            img_url = await imgs[0].get_attribute("content")
-                        else:
-                            img_url = await imgs[0].get_attribute("src")
-                    if img_url and img_url.startswith("http"):
-                        try:
-                            ext = os.path.splitext(urlparse(img_url).path)[1] or ".jpg"
-                            fn = f"{slugify(name)}{ext.lower()[:5]}"
-                            img_path = IMAGES_DIR / fn
-                            resp = await context.request.get(img_url)
-                            if resp.ok:
-                                with open(img_path, "wb") as f:
-                                    f.write(await resp.body())
-                                image_filename = f"images/{fn}"
-                        except Exception:
-                            pass
-
-                    # Fields we don't reliably have from Yellow (left blank to be filled later from MTA)
-                    stars = ""
-                    licence_ref = ""
-                    bedrooms = ""
-                    apartments = ""
-
-                    # Temporary placeholder; enrichment step will overwrite
-                    placeholder_html = (
-                        f"<h3>{name} | Hotel in {location}</h3>"
-                        f"<p><strong>{name}</strong> — full description to follow.</p>"
-                    )
-
-                    rows.append({
-                        "name": name,
-                        "full_address": address,
-                        "location": location,
-                        "area": area,
-                        "stars": stars,
-                        "licence_ref": licence_ref,
-                        "bedrooms": bedrooms,
-                        "apartments": apartments,
-                        "description_html": placeholder_html
-                    })
-                    print(f"[ok] {len(rows)}: {name}")
-
-                except Exception as e:
-                    print(f"[skip] {link} -> {e}")
-
-            page_num += 1
-
-        await browser.close()
-
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["name","full_address","location","area","stars","licence_ref","bedrooms","apartments","description_html"]
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"✅ Scrape complete. {len(rows)} hotels written to {OUTPUT_CSV}")
-
-if __name__ == "__main__":
-    asyncio.run(scrape())
+df = pd.DataFrame(hotel_data)
+df.to_csv("hotels.csv", index=False)
+print(f"✅ Done! Scraped {len(df)} hotels.")
