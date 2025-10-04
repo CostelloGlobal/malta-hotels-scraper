@@ -6,6 +6,7 @@ on:
 jobs:
   scrape_and_enrich:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -16,15 +17,21 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install openai pandas
 
+      # Optional step – will refresh the scraped hotel list if you want to include it here.
       - name: (Optional) Refresh list with quick scraper
-        run: python hotels_scraper_fixed.py || true
+        run: |
+          python hotels_scraper_fixed.py || true
 
       - name: Run AI enrichment
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: python hotels_ai_enrich.py
+        run: |
+          python hotels_ai_enrich.py
 
       - name: Upload AI-ready CSV
         uses: actions/upload-artifact@v4
