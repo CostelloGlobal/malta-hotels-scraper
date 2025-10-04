@@ -1,167 +1,95 @@
-import os, re, time, json
-from urllib.parse import urljoin, urlparse
 import requests
-import pandas as pd
 from bs4 import BeautifulSoup
+import pandas as pd
+import time
 
-# =================== CONFIG ===================
+# ---------------- CONFIG ---------------- #
 BASE = "https://www.yellow.com.mt"
 LIST_URL = BASE + "/hotels/?page="
-HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+}
+MAX_PAGES = 6  # enough to cover ~90 hotels
+SLEEP_BETWEEN = 1.2  # seconds delay per page to be polite
+
 OUT_CSV = "hotels_ai_ready.csv"
 
-SLEEP_LIST = 0.6
-SLEEP_DETAIL = 0.9
-MAX_PAGES = 10  # safety cap
-
-# ============ OpenAI (AI layer) ============
-try:
-    from openai import OpenAI
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-    client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-except Exception:
-    client = None
-
-USE_GPT = client is not None
-MODEL = "gpt-4o-mini"
-
-# ============ MARKETING PROMPT ============
-MARKETING_PROMPT = """
-YOUR MISSION: You are a Malta hotel content specialist creating compelling, SEO-optimised hotel profiles that match VisitMalta.co.uk’s exceptional marketing style.
-
-YOUR ROLE: Create accurate, emotionally engaging, marketing-optimised hotel descriptions for each Malta hotel below. Every description must match the client’s tone and structure perfectly.
-
-DATA SOURCE: Malta Tourism Authority (MTA) licence holder information.
-
-STYLE GUIDE:
-• Emotional, narrative-driven openings (“Where Malta Comes Alive”)
-• Sensory, specific details (luzzu fishing boats, golden stone walls at sunset)
-• Strong metaphors (“front-row seat,” “sanctuary of marble elegance”)
-• Location storytelling that makes readers FEEL the experience
-• Balance between local energy and hotel tranquillity
-
-HTML OUTPUT STRUCTURE:
-<h3>{Hotel Name} | {Star Rating} in {Location}</h3>
-<p><strong>[Compelling Opening Line]</strong></p>
-<p>[Emotional paragraph with sensory storytelling.]</p>
-
-<p><strong>The Vibe:</strong> [Atmosphere]<br>
-<strong>Perfect For:</strong> [Target audience]<br>
-<strong>Key Location Benefits:</strong></p>
-<ul>
-<li>[Specific location detail]</li>
-<li>[Specific location detail]</li>
-<li>[Specific location detail]</li>
-</ul>
-
-<h4>Hotel Features & Atmosphere</h4>
-<p>[Descriptive overview before listing amenities]</p>
-
-<h4>Amenities & Services</h4>
-<p><strong>Hotel Facilities</strong></p>
-<ul>
-<li>[Appropriate facility for star rating]</li>
-<li>[Appropriate facility for star rating]</li>
-</ul>
-
-<p><strong>Room Features</strong></p>
-<ul>
-<li>[Standard room feature]</li>
-<li>[Standard room feature]</li>
-</ul>
-
-<h4>Location & Accessibility</h4>
-<p><strong>📍 Address:</strong> [Full Address]</p>
-"""
-
-# ============ SCRAPER ============
+# ---------------- SCRAPER ---------------- #
 def scrape_hotels():
-    hotels = []
+    all_hotels = []
     for page in range(1, MAX_PAGES + 1):
         url = f"{LIST_URL}{page}"
-        print(f"🔎 Scraping list page {page}...")
+        print(f"Scraping page {page} -> {url}")
         resp = requests.get(url, headers=HEADERS)
+
         if resp.status_code != 200:
-            break
+            print(f"⚠️ Failed to load page {page}: {resp.status_code}")
+            continue
+
         soup = BeautifulSoup(resp.text, "html.parser")
-        cards = soup.select("a.business-card")
+
+        # selector for hotel cards on Yellow.mt
+        cards = soup.select("a.BusinessCardV2style__CardHeaderLink-sc-__sc-1k6t9dc-7")
+
         if not cards:
+            print(f"⚠️ No listings found on page {page}, stopping.")
             break
 
-        for card in cards:
-            name = card.select_one(".business-name")
-            link = card.get("href")
-            if not name or not link:
-                continue
-            full_link = urljoin(BASE, link)
-            name = name.text.strip()
-            print(f"→ {name}")
-            hotels.append({"name": name, "url": full_link})
+        for a in cards:
+            name = a.get_text(strip=True)
+            href = a.get("href")
+            if href and not href.startswith("http"):
+                href = BASE + href
 
-        time.sleep(SLEEP_LIST)
-    return hotels
+            # follow the link to get details
+            details = scrape_hotel_details(href)
+            all_hotels.append({
+                "name": name,
+                "url": href,
+                "address": details.get("address", ""),
+                "phone": details.get("phone", ""),
+                "email": details.get("email", "")
+            })
 
-# ============ HOTEL DETAIL PARSER ============
-def parse_hotel_detail(url):
-    resp = requests.get(url, headers=HEADERS)
-    if resp.status_code != 200:
-        return {}
-    soup = BeautifulSoup(resp.text, "html.parser")
-    addr = soup.select_one(".address")
-    desc = soup.select_one(".description")
-    area = soup.select_one(".location-name")
-    return {
-        "full_address": addr.text.strip() if addr else "",
-        "description_raw": desc.text.strip() if desc else "",
-        "location": area.text.strip() if area else "",
-    }
+        print(f"✅ Page {page}: found {len(cards)} hotels")
+        time.sleep(SLEEP_BETWEEN)
 
-# ============ AI DESCRIPTION GENERATOR ============
-def generate_description(name, addr, location, raw_text):
-    if not USE_GPT:
-        return raw_text or ""
-    prompt = f"{MARKETING_PROMPT}\n\nGenerate a complete HTML hotel profile for:\nHotel name: {name}\nAddress: {addr}\nLocation: {location}\n\nDetails from source:\n{raw_text}\n\nWrite full HTML output below."
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=1200,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"⚠️ AI failed for {name}: {e}")
-        return raw_text or ""
-
-# ============ MAIN ============
-def main():
-    hotels = scrape_hotels()
-    rows = []
-    for h in hotels:
-        print(f"🏨 Processing: {h['name']}")
-        detail = parse_hotel_detail(h["url"])
-        html = generate_description(
-            h["name"],
-            detail.get("full_address", ""),
-            detail.get("location", ""),
-            detail.get("description_raw", "")
-        )
-        rows.append({
-            "name": h["name"],
-            "full_address": detail.get("full_address", ""),
-            "location": detail.get("location", ""),
-            "area": "",
-            "stars": "",
-            "licence_ref": "",
-            "bedrooms": "",
-            "apartments": "",
-            "description_html": html
-        })
-        time.sleep(SLEEP_DETAIL)
-
-    df = pd.DataFrame(rows)
+    # save to CSV
+    df = pd.DataFrame(all_hotels)
     df.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"✅ Wrote {len(df)} hotels to {OUT_CSV}")
+    print(f"\n✅ Wrote {len(all_hotels)} hotels to {OUT_CSV}")
 
+
+# ---------------- DETAIL SCRAPER ---------------- #
+def scrape_hotel_details(url):
+    info = {}
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        if resp.status_code != 200:
+            return info
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Try to get contact info (Yellow.mt structure)
+        address_tag = soup.select_one("div.Addressstyle__AddressLine-sc-__sc-14lcyur-2")
+        phone_tag = soup.select_one("a[href^='tel:']")
+        email_tag = soup.select_one("a[href^='mailto:']")
+
+        if address_tag:
+            info["address"] = address_tag.get_text(strip=True)
+        if phone_tag:
+            info["phone"] = phone_tag.get_text(strip=True)
+        if email_tag:
+            info["email"] = email_tag.get_text(strip=True)
+
+    except Exception as e:
+        print(f"⚠️ Error scraping {url}: {e}")
+
+    return info
+
+
+# ---------------- MAIN ---------------- #
 if __name__ == "__main__":
-    main()
+    print("🚀 Starting full Malta Hotels scrape...")
+    scrape_hotels()
+    print("✅ Done.")
