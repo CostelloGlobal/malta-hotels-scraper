@@ -4,7 +4,7 @@ from playwright.async_api import async_playwright
 
 # ------------ CONFIG ------------
 START_URL = "https://www.yellow.com.mt/hotels/malta/"
-MAX_HOTELS = 50
+MAX_HOTELS = 999
 OUTPUT_CSV = "hotels.csv"
 CATEGORY = "Hotel"
 # --------------------------------
