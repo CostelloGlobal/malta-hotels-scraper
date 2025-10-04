@@ -1,0 +1,32 @@
+name: Test 5 Malta Hotels
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape_test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run hotel test scraper
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python hotels_test.py
+
+      - name: Upload test results CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: hotels_test_output
+          path: hotels_test_output.csv
