@@ -1,2 +1,4 @@
-playwright==1.39.0
+requests
+beautifulsoup4
+pandas
 openai>=1.40.0
