@@ -13,23 +13,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      # If you want to force a fresh list first, keep this.
-      # If not needed, you can delete this step.
       - name: (Optional) Refresh list with quick scraper
-        run: |
-          python hotels_scraper_fixed.py || true
+        run: python hotels_scraper_fixed.py || true
 
       - name: Run AI enrichment
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          python hotels_ai_enrich.py
+        run: python hotels_ai_enrich.py
 
       - name: Upload AI-ready CSV
         uses: actions/upload-artifact@v4
