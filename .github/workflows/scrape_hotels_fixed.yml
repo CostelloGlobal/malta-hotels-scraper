@@ -1,0 +1,29 @@
+name: Scrape All Malta Hotels (Fixed)
+
+on:
+  workflow_dispatch: # run manually from Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run fixed scraper
+        run: python hotels_scraper_fixed.py
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: hotels_scraped
+          path: hotels_scraped.csv
