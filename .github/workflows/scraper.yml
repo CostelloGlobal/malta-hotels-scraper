@@ -1,7 +1,7 @@
 name: Scrape Hotels
 
 on:
-  workflow_dispatch:  # lets you run manually
+  workflow_dispatch:   # run manually from GitHub Actions tab
 
 jobs:
   scrape:
@@ -9,10 +9,10 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -25,7 +25,7 @@ jobs:
         run: python scraper.py
 
       - name: Upload CSV
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4   # ✅ updated to v4
         with:
-          name: hotels-csv
-          path: hotels.csv
+          name: raw-hotels
+          path: raw_hotels.csv
