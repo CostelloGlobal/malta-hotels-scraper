@@ -1,31 +1,32 @@
 import os
 import pandas as pd
-from openai import OpenAI
+import openai
 
-# -----------------------
+# ==============================
 # CONFIGURATION
-# -----------------------
-INPUT_CSV = "hotels_all_output.csv"   # your master scrape file
-OUTPUT_CSV = "hotels_ai_ready.csv"    # enriched AI content file
-MODEL = "gpt-4o-mini"                 # efficient, creative model
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ==============================
+INPUT_CSV = "hotels_all_output.csv"   # master scrape file
+OUTPUT_CSV = "hotels_ai_ready.csv"    # enriched AI content output
+MODEL = "gpt-4o-mini"                 # efficient creative model
 
-# -----------------------
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# ==============================
 # PROMPT TEMPLATE
-# -----------------------
+# ==============================
 PROMPT_TEMPLATE = """
-You are a Malta hotel content specialist creating compelling, SEO-optimised hotel profiles for VisitMalta.co.uk.
+You are a Malta hotel content specialist creating compelling, SEO-optimised hotel descriptions for VisitMalta.co.uk. 
+Use the data provided for each hotel to craft a rich, emotional, sensory narrative that matches the client’s approved marketing style.
 
 CRITICAL REQUIREMENTS:
-- 100% factual accuracy from given data (no invented amenities or names)
-- Must follow the exact HTML structure below
-- Use sensory, emotional language and vivid detail
-- Tone: professional, descriptive, immersive
-- Use only English (UK spelling)
+- 100% factual accuracy (no invented amenities or locations)
+- Follow the exact HTML structure below
+- Use sensory, emotional, narrative-driven language
+- Include area and atmosphere details specific to Malta
+- Use only English (UK)
 - Ensure all HTML tags close properly
-- Do NOT include Markdown
-
-Write the description in this HTML structure using the provided hotel data.
+- Do NOT include Markdown, only pure HTML
+- Be concise, engaging, and human in tone
 
 HTML TEMPLATE:
 <h3>{name} | {stars}-Star Hotel in {location}</h3>
@@ -54,87 +55,85 @@ HTML TEMPLATE:
 </ul>
 <p><strong>Room Features</strong></p>
 <ul>
-<li>[Room feature 1]</li>
-<li>[Room feature 2]</li>
+<li>[Feature 1]</li>
+<li>[Feature 2]</li>
 </ul>
 
 <h4>Location & Accessibility</h4>
 <p><strong>📍 Address:</strong> {full_address}</p>
+<p><strong>Within Walking Distance:</strong></p>
+<ul>
+<li>[Nearby attraction 1]</li>
+<li>[Nearby attraction 2]</li>
+</ul>
+<p><strong>Transportation:</strong></p>
+<ul>
+<li>[Transport option 1]</li>
+<li>[Transport option 2]</li>
+</ul>
 
 <h4>Guest Experiences</h4>
 <p><strong>What Visitors Love</strong></p>
 <ul>
-<li>[Positive, realistic emotional point]</li>
-<li>[Positive, realistic emotional point]</li>
+<li>[Realistic positive point with emotional tone]</li>
+<li>[Realistic positive point with emotional tone]</li>
+</ul>
+<p><strong>Local Insight</strong></p>
+<ul>
+<li>[Useful local tip with sensory detail]</li>
+<li>[Useful local tip with sensory detail]</li>
 </ul>
 
-<p><strong>Ready to experience {location}?</strong><br>
+<p><strong>Ready to [experience]?</strong><br>
 [BOOK NOW - KM Malta Airlines Packages]</p>
-
-DATA PROVIDED:
-Name: {name}
-Address: {full_address}
-Location: {location}
-Area: {area}
-Stars: {stars}
-Licence: {licence_ref}
-Bedrooms: {bedrooms}
-Apartments: {apartments}
 """
 
-# -----------------------
-# FUNCTION
-# -----------------------
-
+# ==============================
+# ENRICHMENT FUNCTION
+# ==============================
 def enrich_hotels():
-    if not os.path.exists(INPUT_CSV):
-        print(f"⚠️ No '{INPUT_CSV}' found. Skipping enrichment.")
-        return
-
     df = pd.read_csv(INPUT_CSV)
-    enriched_rows = []
+    descriptions = []
 
-    for idx, row in df.iterrows():
+    for i, row in df.iterrows():
+        print(f"✨ Enriching: {row.get('name', 'Unknown Hotel')}")
+
+        # Combine row data into a single prompt input
+        row_text = (
+            f"Hotel Name: {row.get('name', '')}\n"
+            f"Address: {row.get('full_address', '')}\n"
+            f"Location: {row.get('location', '')}\n"
+            f"Area: {row.get('area', '')}\n"
+            f"Stars: {row.get('stars', '')}\n"
+            f"Licence: {row.get('licence_ref', '')}\n"
+            f"Bedrooms: {row.get('bedrooms', '')}\n"
+            f"Apartments: {row.get('apartments', '')}\n"
+        )
+
         try:
-            print(f"✨ Enriching: {row.get('name', 'Unknown Hotel')} ({idx+1}/{len(df)})")
-
-            prompt = PROMPT_TEMPLATE.format(
-                name=row.get("name", ""),
-                full_address=row.get("full_address", ""),
-                location=row.get("location", ""),
-                area=row.get("area", ""),
-                stars=row.get("stars", ""),
-                licence_ref=row.get("licence_ref", ""),
-                bedrooms=row.get("bedrooms", ""),
-                apartments=row.get("apartments", "")
-            )
-
-            completion = client.chat.completions.create(
+            response = openai.ChatCompletion.create(
                 model=MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a professional Malta hotel copywriter and SEO content expert."},
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": PROMPT_TEMPLATE},
+                    {"role": "user", "content": row_text},
                 ],
                 temperature=0.8,
-                max_tokens=1200
+                max_tokens=1000,
             )
 
-            html_desc = completion.choices[0].message.content.strip()
-            row["description_html"] = html_desc
-            enriched_rows.append(row)
+            ai_description = response["choices"][0]["message"]["content"].strip()
+            descriptions.append(ai_description)
 
         except Exception as e:
-            print(f"❌ Error enriching {row.get('name', '')}: {e}")
-            continue
+            print(f"⚠️ Error enriching {row.get('name', '')}: {e}")
+            descriptions.append("")
 
-    if not enriched_rows:
-        print("⚠️ No hotels were enriched — check input file.")
-        return
+    df["description_html"] = descriptions
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    print(f"✅ Done — enriched descriptions saved to {OUTPUT_CSV}")
 
-    enriched_df = pd.DataFrame(enriched_rows)
-    enriched_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"✅ Enrichment complete! Output saved as: {OUTPUT_CSV}")
-
-
+# ==============================
+# MAIN EXECUTION
+# ==============================
 if __name__ == "__main__":
     enrich_hotels()
