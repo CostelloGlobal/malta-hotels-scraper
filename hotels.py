@@ -1,16 +1,16 @@
 import requests
 import pandas as pd
 import time
+import os
 from bs4 import BeautifulSoup
 import openai
-import os
 
-# 🔧 Configuration
+# --- Configuration ---
 BASE_URL = "https://www.yellow.com.mt/hotels/?page={}"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# 🔁 Scraper
+# --- Scraper ---
 def scrape_hotels():
     all_hotels = []
     page = 1
@@ -22,7 +22,6 @@ def scrape_hotels():
         soup = BeautifulSoup(res.text, "html.parser")
 
         cards = soup.select("a.business-name, div.business-card a, h2 a, .business-listing a")
-
         if not cards:
             print("✅ No more listings found.")
             break
@@ -30,7 +29,6 @@ def scrape_hotels():
         for card in cards:
             name = card.get_text(strip=True)
             link = card.get("href")
-
             if not link or not name:
                 continue
 
@@ -38,75 +36,34 @@ def scrape_hotels():
             hotel_res = requests.get(hotel_page, headers=HEADERS)
             hotel_soup = BeautifulSoup(hotel_res.text, "html.parser")
 
-            try:
-                address = hotel_soup.select_one(".address, .business-address").get_text(strip=True)
-            except:
-                address = ""
+            description_tag = hotel_soup.find("meta", {"name": "description"})
+            description = description_tag["content"] if description_tag else ""
 
             try:
-                area = hotel_soup.select_one(".locality, .area").get_text(strip=True)
-            except:
-                area = ""
-
-            try:
-                stars = hotel_soup.select_one(".rating, .stars").get_text(strip=True)
-            except:
-                stars = ""
-
-            # Generate creative marketing description
-            prompt = f"""
-            You are a Malta hotel content specialist creating compelling, SEO-optimised hotel profiles for VisitMalta.co.uk.
-            Write a high-quality marketing description in HTML for:
-            Name: {name}
-            Address: {address}
-            Area: {area}
-            Stars: {stars}
-
-            Follow the provided structure and tone:
-            - Emotional, narrative opening (“Where Malta Comes Alive”)
-            - Sensory, descriptive storytelling
-            - HTML headings and tags (no markdown)
-            Output must follow the exact HTML structure from client brief.
-            """
-
-            try:
-                completion = openai.ChatCompletion.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "system", "content": "You are a luxury hotel content writer for VisitMalta.co.uk."},
-                              {"role": "user", "content": prompt}]
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant that enriches hotel listings with useful summaries."},
+                        {"role": "user", "content": f"Enrich this hotel listing: {name}, {description}"}
+                    ]
                 )
-                description_html = completion.choices[0].message.content.strip()
+                ai_description = response["choices"][0]["message"]["content"]
             except Exception as e:
-                print(f"❌ OpenAI generation failed: {e}")
-                description_html = ""
+                ai_description = f"AI generation failed: {e}"
 
             all_hotels.append({
                 "name": name,
-                "full_address": address,
-                "location": "Malta",
-                "area": area,
-                "stars": stars,
-                "licence_ref": "",
-                "bedrooms": "",
-                "apartments": "",
-                "description_html": description_html
+                "url": hotel_page,
+                "description": description,
+                "ai_summary": ai_description
             })
 
-            time.sleep(2)  # polite delay
-
         page += 1
-        time.sleep(1)
+        time.sleep(2)
 
-    return all_hotels
-
-
-# 💾 Save CSV
-def save_hotels(hotels):
-    df = pd.DataFrame(hotels)
+    df = pd.DataFrame(all_hotels)
     df.to_csv("hotels_enriched.csv", index=False)
-    print(f"✅ Saved {len(hotels)} hotels to hotels_enriched.csv")
-
+    print("✅ Scraping complete — results saved to hotels_enriched.csv")
 
 if __name__ == "__main__":
-    hotels = scrape_hotels()
-    save_hotels(hotels)
+    scrape_hotels()
