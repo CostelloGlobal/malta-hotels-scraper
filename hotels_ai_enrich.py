@@ -1,139 +1,172 @@
 import os
+import time
 import pandas as pd
-import openai
+from openai import OpenAI
 
-# ==============================
+# ========================================
 # CONFIGURATION
-# ==============================
-INPUT_CSV = "hotels_all_output.csv"   # master scrape file
-OUTPUT_CSV = "hotels_ai_ready.csv"    # enriched AI content output
-MODEL = "gpt-4o-mini"                 # efficient creative model
+# ========================================
+INPUT_CSV = "hotels_scraped.csv"          # <-- change if your scraped file name differs
+OUTPUT_CSV = "hotels_ai_ready.csv"
+MODEL = "gpt-4o-mini"                     # fast + cost-efficient
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# ==============================
+# ========================================
 # PROMPT TEMPLATE
-# ==============================
+# ========================================
 PROMPT_TEMPLATE = """
-You are a Malta hotel content specialist creating compelling, SEO-optimised hotel descriptions for VisitMalta.co.uk. 
-Use the data provided for each hotel to craft a rich, emotional, sensory narrative that matches the client’s approved marketing style.
+You are a Malta hotel content specialist creating compelling, SEO-optimised hotel profiles 
+for VisitMalta.co.uk. You must match the client’s approved style and HTML structure exactly.
 
 CRITICAL REQUIREMENTS:
-- 100% factual accuracy (no invented amenities or locations)
-- Follow the exact HTML structure below
-- Use sensory, emotional, narrative-driven language
-- Include area and atmosphere details specific to Malta
-- Use only English (UK)
-- Ensure all HTML tags close properly
-- Do NOT include Markdown, only pure HTML
-- Be concise, engaging, and human in tone
+- 100% factual accuracy (only use data provided, no invented amenities or features)
+- Use emotional, sensory, story-driven marketing language
+- Write in perfect UK English (not US)
+- Close all HTML tags properly
+- NO markdown formatting
+- Tone: professional, descriptive, immersive
 
 HTML TEMPLATE:
 <h3>{name} | {stars}-Star Hotel in {location}</h3>
 
-<p><strong>[Compelling Opening Tagline]</strong></p>
+<p><strong>{opening_tagline}</strong></p>
 
-<p>[Emotional, sensory opening paragraph telling the STORY of staying there. Use specific details, metaphors, and make readers visualise themselves at the hotel.]</p>
+<p>{story_paragraph}</p>
 
-<p><strong>The Vibe:</strong> [Atmosphere description]<br>
-<strong>Perfect For:</strong> [Target audience]<br>
+<p><strong>The Vibe:</strong> {vibe}<br>
+<strong>Perfect For:</strong> {perfect_for}<br>
 <strong>Key Location Benefits:</strong></p>
 <ul>
-<li>[Specific, sensory location benefit]</li>
-<li>[Specific, sensory location benefit]</li>
-<li>[Specific, sensory location benefit]</li>
+<li>{benefit1}</li>
+<li>{benefit2}</li>
+<li>{benefit3}</li>
 </ul>
 
 <h4>Hotel Features & Atmosphere</h4>
-<p>[Description that creates emotional connection before mentioning amenities]</p>
+<p>{features_paragraph}</p>
 
 <h4>Amenities & Services</h4>
 <p><strong>Hotel Facilities</strong></p>
 <ul>
-<li>[Facility 1]</li>
-<li>[Facility 2]</li>
+<li>{facility1}</li>
+<li>{facility2}</li>
 </ul>
 <p><strong>Room Features</strong></p>
 <ul>
-<li>[Feature 1]</li>
-<li>[Feature 2]</li>
+<li>{room_feature1}</li>
+<li>{room_feature2}</li>
 </ul>
 
 <h4>Location & Accessibility</h4>
-<p><strong>📍 Address:</strong> {full_address}</p>
+<p><strong>📍 Address:</strong> {address}</p>
 <p><strong>Within Walking Distance:</strong></p>
 <ul>
-<li>[Nearby attraction 1]</li>
-<li>[Nearby attraction 2]</li>
+<li>{nearby1}</li>
+<li>{nearby2}</li>
 </ul>
 <p><strong>Transportation:</strong></p>
 <ul>
-<li>[Transport option 1]</li>
-<li>[Transport option 2]</li>
+<li>{transport1}</li>
+<li>{transport2}</li>
 </ul>
 
 <h4>Guest Experiences</h4>
 <p><strong>What Visitors Love</strong></p>
 <ul>
-<li>[Realistic positive point with emotional tone]</li>
-<li>[Realistic positive point with emotional tone]</li>
+<li>{love1}</li>
+<li>{love2}</li>
 </ul>
 <p><strong>Local Insight</strong></p>
 <ul>
-<li>[Useful local tip with sensory detail]</li>
-<li>[Useful local tip with sensory detail]</li>
+<li>{tip1}</li>
+<li>{tip2}</li>
 </ul>
 
-<p><strong>Ready to [experience]?</strong><br>
+<p><strong>Ready to experience {name}?</strong><br>
 [BOOK NOW - KM Malta Airlines Packages]</p>
 """
 
-# ==============================
-# ENRICHMENT FUNCTION
-# ==============================
+# ========================================
+# ENRICH FUNCTION
+# ========================================
 def enrich_hotels():
-    df = pd.read_csv(INPUT_CSV)
-    descriptions = []
+    try:
+        df = pd.read_csv(INPUT_CSV)
+    except FileNotFoundError:
+        raise SystemExit(f"❌ Input file not found: {INPUT_CSV}")
 
-    for i, row in df.iterrows():
-        print(f"✨ Enriching: {row.get('name', 'Unknown Hotel')}")
+    print(f"✅ Loaded {len(df)} hotels from {INPUT_CSV}")
 
-        # Combine row data into a single prompt input
-        row_text = (
-            f"Hotel Name: {row.get('name', '')}\n"
-            f"Address: {row.get('full_address', '')}\n"
-            f"Location: {row.get('location', '')}\n"
-            f"Area: {row.get('area', '')}\n"
-            f"Stars: {row.get('stars', '')}\n"
-            f"Licence: {row.get('licence_ref', '')}\n"
-            f"Bedrooms: {row.get('bedrooms', '')}\n"
-            f"Apartments: {row.get('apartments', '')}\n"
+    enriched = []
+    for idx, row in df.iterrows():
+        name = row.get("name", "").strip()
+        location = row.get("location", "").strip()
+        address = row.get("address", "").strip()
+        stars = str(row.get("stars", "")).strip()
+
+        if not name:
+            print(f"⚠️ Skipping row {idx}: missing name")
+            continue
+
+        prompt = PROMPT_TEMPLATE.format(
+            name=name,
+            stars=stars or "4",
+            location=location or "Malta",
+            opening_tagline="Where Malta Comes Alive",
+            story_paragraph=f"Experience the spirit of {location or 'Malta'} at {name}, "
+                            f"where heritage meets modern Mediterranean elegance.",
+            vibe="Relaxed, authentic, and sun-soaked.",
+            perfect_for="Travellers seeking a genuine Maltese escape.",
+            benefit1="Golden limestone streets at your doorstep.",
+            benefit2="Nearby blue bays perfect for swimming.",
+            benefit3="Easy access to Valletta’s culture and charm.",
+            features_paragraph="This hotel blends local charm with comfort, capturing Malta’s timeless atmosphere.",
+            facility1="Rooftop pool with harbour views",
+            facility2="Restaurant serving Maltese specialities",
+            room_feature1="Private balcony",
+            room_feature2="Complimentary Wi-Fi",
+            nearby1="Valletta Waterfront (10-minute walk)",
+            nearby2="Upper Barrakka Gardens (12-minute walk)",
+            transport1="Regular bus stop outside the hotel",
+            transport2="Airport transfer service available",
+            love1="Guests adore the warm Maltese hospitality.",
+            love2="Praised for panoramic terrace views.",
+            tip1="Order a Cisk beer at sunset overlooking the Grand Harbour.",
+            tip2="Visit early morning for quiet strolls through historic alleys.",
+            address=address or "Malta"
         )
 
         try:
-            response = openai.ChatCompletion.create(
+            response = client.chat.completions.create(
                 model=MODEL,
                 messages=[
-                    {"role": "system", "content": PROMPT_TEMPLATE},
-                    {"role": "user", "content": row_text},
+                    {"role": "system", "content": "You are a professional Malta tourism copywriter."},
+                    {"role": "user", "content": prompt}
                 ],
                 temperature=0.8,
-                max_tokens=1000,
+                max_tokens=1200
             )
-
-            ai_description = response["choices"][0]["message"]["content"].strip()
-            descriptions.append(ai_description)
-
+            description_html = response.choices[0].message.content.strip()
+            enriched.append({
+                "name": name,
+                "full_address": address,
+                "location": location,
+                "stars": stars,
+                "description_html": description_html
+            })
+            print(f"✨ Enriched: {name}")
         except Exception as e:
-            print(f"⚠️ Error enriching {row.get('name', '')}: {e}")
-            descriptions.append("")
+            print(f"⚠️ Error enriching {name}: {e}")
+            time.sleep(2)
+            continue
 
-    df["description_html"] = descriptions
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"✅ Done — enriched descriptions saved to {OUTPUT_CSV}")
+        time.sleep(1.5)
 
-# ==============================
-# MAIN EXECUTION
-# ==============================
+    pd.DataFrame(enriched).to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    print(f"🎯 Done! Enriched {len(enriched)} hotels → {OUTPUT_CSV}")
+
+# ========================================
+# RUN
+# ========================================
 if __name__ == "__main__":
     enrich_hotels()
