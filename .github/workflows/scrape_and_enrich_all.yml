@@ -1,0 +1,42 @@
+name: Scrape + Enrich All Malta Hotels (AI Full Flow)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  full_run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # STEP 1: Scrape hotels list (refresh)
+      - name: Scrape Malta Hotels
+        run: |
+          echo "⚙️ Running scraper to refresh base CSV..."
+          python hotels_scraper_fixed.py
+
+      # STEP 2: Run AI enrichment
+      - name: Enrich with AI
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "🤖 Running AI enrichment pipeline..."
+          python hotels_ai_enrich.py
+
+      # STEP 3: Upload final enriched CSV
+      - name: Upload AI-enriched CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: hotels_ai_ready
+          path: hotels_ai_ready.csv
